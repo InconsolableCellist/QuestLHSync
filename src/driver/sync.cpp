@@ -798,7 +798,6 @@ Solver::Solver(LogFn log, uint64_t seed, std::map<std::string, V3> fix)
 
 void Solver::Forget() {
   has_x_ = has_anchor_ = has_acq_x_ = false;
-  dead_since_ = 1e18; x_dead_ = false;
   body_wait_ = 1e18;
   amb_state_ = 0;
   last_acq_ = -1e18;
@@ -808,7 +807,6 @@ void Solver::Forget() {
 
 void Solver::Reset(const X4 &x) {
   x_ = x; has_x_ = true;
-  dead_since_ = 1e18; x_dead_ = false;
   resets_++;
   anchor_ = x; has_anchor_ = true;
   id_said_.clear();
@@ -1588,7 +1586,7 @@ void Solver::CheckMirror(X4 &best, int &bs, const std::vector<V3> &S, const std:
     pick_m = fav == 2;
     state = pick_m ? 1 : 2;
     why = how + (pick_m ? ": the mirror" : ": the fit");
-  } else if (has_x_ && !x_dead_) {
+  } else if (has_x_) {
     pick_m = Apart(m, x_, S) < Apart(best, x_, S);
     state = 3;
     why = "no lighthouse device near the head tells them apart: the current fit stays";
@@ -1871,19 +1869,6 @@ StepStat Solver::Step(double /*now*/) {
     if (Acquire(now, xa, sa, tight)) {
       int cur = has_x_ ? ThinnedScore(x_, now) : 0;
       st.has_acq = true; st.acq_sa = sa; st.acq_cur = cur; st.acq_tight = tight;
-      // a current fit the sightings don't back (a stale seed, or a wrong fit) is no fit: the guards below protect a
-      // working one from a lucky candidate, and would keep a dead one for good (a dead one has 0 support, a candidate in
-      // a two-station room seldom twice ACQ, and the worn devices only tell a fit from its mirror)
-      if (has_x_ && cur * 4 < ACQ && sa >= ACQ / 2) {
-        if (dead_since_ > now) dead_since_ = now;
-        if (!x_dead_ && now - dead_since_ >= kDeadFor) {
-          x_dead_ = true;
-          log_(Fmt("the current fit (yaw %+.1f deg) has explained next to no sightings for %.0f s (support %d, a candidate "
-                   "%d): acquiring as if from scratch", x_[0] * kDeg, now - dead_since_, cur, sa));
-        }
-      } else if (cur * 4 >= ACQ) {
-        dead_since_ = 1e18; x_dead_ = false;
-      }
       // the mirror check's flip has the worn devices for evidence as well: half the support will do. A fit far off the
       // current one (four stations in a square fit about as well turned by 90 deg) goes by the worn or held devices
       // too; without them it takes twice the support, or tight sightings: a wrong fit that lines stations up with other
@@ -1891,7 +1876,7 @@ StepStat Solver::Step(double /*now*/) {
       int k = acq_dim_ ? 2 : 1;  // dim rays: other lights line up with a wrong alignment more easily
       double dn, dc;
       std::string how;
-      bool far = has_x_ && !x_dead_ && !acq_forced_ && Apart(xa, x_, S) > 1.0;
+      bool far = has_x_ && !acq_forced_ && Apart(xa, x_, S) > 1.0;
       int fav = far ? BodyFavours(xa, x_, dn, dc, how) : 0;
       if (far && fav != 1 && body_bins_) {  // a candidate the devices allow, a current fit they don't
         const std::vector<BodyBin> bins = body_bins_();
@@ -2706,7 +2691,6 @@ void Sync::Use(const Shot &f) {
     prev = big;
   }
   if (still) { spots_.still += nb; return; }
-  fixed_frames_[cam]++;
   M3 Rc;
   V3 tc;
   if (have_lag && w <= kWmax && optics_.Pose(cam, Rc, tc)) solver_.AddFrame(t, hg, cam, p + R * tc, R * Rc);
@@ -2721,7 +2705,6 @@ void Sync::Use(const Shot &f) {
     if (npx > kMaxPx) { spots_.big++; continue; }
     V3 o, d;
     if (!optics_.Ray(cam, x10 / 10.0 - 0.5, y10 / 10.0 - 0.5, o, d)) { spots_.other++; continue; }
-    if (FixedSpot(cam, x10, y10, R * d)) { spots_.fixed++; continue; }
     PendSpot q{o, d, R * d, p, R, hg, grid_pc, w, b.peak, have_lag, 1, -1, false};
     if (!pend.empty()) {  // lit in this direction in the camera's last short frame too
       const std::vector<PendSpot> &pv = pend.back().s;
@@ -2766,37 +2749,6 @@ void Sync::FlushSteady(int cam, size_t keep) {
   }
 }
 
-bool Sync::FixedSpot(int cam, int x10, int y10, V3 d) {
-  const long n = fixed_frames_[cam];
-  const float a = 1.0f / kFixedFrames;
-  auto &cells = fixed_[cam];
-  auto decay = [&](FixedCell &c) {  // to this frame
-    if (c.at < n) {
-      float k = std::pow(1 - a, (float)(n - c.at));
-      c.rate *= k;
-      c.dir = c.dir * k;
-      c.at = n;
-    }
-  };
-  const int bx = x10 / (10 * kFixedPx), by = y10 / (10 * kFixedPx);
-  auto key = [](int x, int y) { return (x + 1) * 4096 + (y + 1); };  // cells from -1 (a neighbour off the edge)
-  float rate = 0;
-  V3 dir;
-  for (int dy = -1; dy <= 1; dy++)
-    for (int dx = -1; dx <= 1; dx++) {
-      auto it = cells.find(key(bx + dx, by + dy));
-      if (it == cells.end()) continue;
-      decay(it->second);
-      rate += it->second.rate;
-      dir += it->second.dir;
-    }
-  FixedCell &c = cells[key(bx, by)];
-  decay(c);
-  c.rate += a;
-  c.dir += d * a;
-  return rate >= kFixedRate && norm(dir) < kFixedSpread * rate;
-}
-
 std::string Sync::Describe(const Spots &a, const Spots &b) {
   long n = b.seen - a.seen;
   if (!n) return Fmt("no bright spots on %ld camera frames", b.frames - a.frames);
@@ -2805,7 +2757,6 @@ std::string Sync::Describe(const Spots &a, const Spots &b) {
   part(b.still - a.still, "while the headset was still");
   part(b.fast - a.fast, "while it turned fast");
   part(b.big - a.big, "lamps or windows");
-  part(b.fixed - a.fixed, "fixed to the headset");
   part(b.steady - a.steady, "steady lights");
   part(b.other - a.other, "without a headset pose");
   part(b.dim - a.dim, "dim, kept for a room too light for the dots to saturate");

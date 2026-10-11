@@ -22,7 +22,6 @@
 #include <random>
 #include <set>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "mathx.h"
@@ -407,11 +406,6 @@ class Solver {
     double d = BodyFar(x, b);
     return !std::isfinite(d) || d <= kBodyFar;
   }
-  // the current fit explains next to none of the sightings the acquisitions find support in (a stale seed from
-  // state.json, or a wrong fit): since when, and whether that has lasted kDeadFor, when it stops counting as a fit
-  static constexpr double kDeadFor = 20.0;
-  double dead_since_ = 1e18;
-  bool x_dead_ = false;
 
   Rays GetRays(double t0);
   void Support(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double gate, std::vector<int> &cnt) const;
@@ -508,7 +502,7 @@ class Sync {
   };
   Status GetStatus(double now);
   // the cameras' bright spots so far, and what became of them
-  struct Spots { long frames = 0, seen = 0, used = 0, still = 0, fast = 0, big = 0, other = 0, dim = 0, fixed = 0, steady = 0; };
+  struct Spots { long frames = 0, seen = 0, used = 0, still = 0, fast = 0, big = 0, other = 0, dim = 0, steady = 0; };
   Spots spots() { std::lock_guard<std::mutex> g(net_); return spots_; }
   static std::string Describe(const Spots &from, const Spots &to);
   void StationsForDump(std::vector<std::string> &keys, std::vector<V3> &S) const {  // tools
@@ -558,18 +552,6 @@ class Sync {
   Spots spots_;  // under net_
   std::map<int, std::vector<std::pair<double, double>>> prev_big_;  // under net_: each camera's last steady lights
   long img_moved_ = 0, img_still_ = 0;  // under net_: of those, while SteamVR's headset stands still
-  // under net_: spots that keep to the same pixels while the head moves are fixed to the headset (a Frame's front
-  // cameras see glints of its own in nearly every frame, a third to half of all its bright spots), not a base station:
-  // each camera's hit rate per kFixedPx pixel cell, over about the last kFixedFrames moving frames, and the sum of its
-  // spots' directions in the room the same way: a base station looked at steadily keeps to a cell too, but its spots
-  // all point at it, while a glint's swing round with the head
-  struct FixedCell { float rate = 0; V3 dir; long at = 0; };
-  std::map<int, std::unordered_map<int, FixedCell>> fixed_;
-  std::map<int, long> fixed_frames_;
-  static constexpr int kFixedPx = 8, kFixedFrames = 300;
-  static constexpr float kFixedRate = 0.4f;  // a cell lit in this share of the moving frames
-  static constexpr double kFixedSpread = 0.99;  // ... whose spots' mean direction is shorter than this (~8 deg apart)
-  bool FixedSpot(int cam, int x10, int y10, V3 d);
   // under net_: steady lights. A base station's laser shows in a short frame only when its sweep and the exposure meet,
   // a frame or two in a row at most (the recording: 22-43% of its sightings in the very next frame); a lamp or LED that
   // is on shows in every frame it's in view (96-99%), and one about 1 m from a base station drew the fit there, 0.7-1 m
