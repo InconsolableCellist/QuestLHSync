@@ -1,6 +1,7 @@
 #include "sync.h"
 
 #include <algorithm>
+#include <numeric>
 #include <cctype>
 #include <cstdarg>
 #include <cstring>
@@ -795,8 +796,19 @@ void Frame::Update(const std::map<std::string, std::pair<V3, M3>> &raw) {
 Solver::Solver(LogFn log, uint64_t seed, std::map<std::string, V3> fix)
     : fix_(std::move(fix)), log_(std::move(log)), rng_(seed) {}
 
+void Solver::Forget() {
+  has_x_ = has_anchor_ = has_acq_x_ = false;
+  dead_since_ = 1e18; x_dead_ = false;
+  body_wait_ = 1e18;
+  amb_state_ = 0;
+  last_acq_ = -1e18;
+  id_said_.clear();
+  resets_++;
+}
+
 void Solver::Reset(const X4 &x) {
   x_ = x; has_x_ = true;
+  dead_since_ = 1e18; x_dead_ = false;
   resets_++;
   anchor_ = x; has_anchor_ = true;
   id_said_.clear();
@@ -1010,10 +1022,11 @@ void Solver::Support(const X4 &x, const std::vector<V3> &S, const std::vector<V3
   }
 }
 
-int Solver::Score(const std::vector<int> &c) {  // yaw needs two stations: the second-best count
+int Solver::Score(const std::vector<int> &c) const {  // yaw needs two stations: the second-best count
   if (c.size() < 2) return 0;
   std::vector<int> v = c;
   std::sort(v.begin(), v.end());
+  if (dim_dots_) return std::accumulate(v.begin(), v.end() - 1, 0);  // all but the best (dim_dots_)
   return v[v.size() - 2];
 }
 
@@ -1313,13 +1326,14 @@ void Solver::BatchSupport(const std::vector<X4> &H, const std::vector<V3> &S, co
   }
 }
 
-bool Solver::Starved(const Rays &r) {
+bool Solver::Starved(const Rays &r) const {
+  if (dim_dots_) return !r.B.empty();
   size_t nb = 0;
   for (char b : r.B) nb += b != 0;
   return !r.B.empty() && r.size() >= 200 && nb * 20 < r.size();
 }
 
-Solver::Rays Solver::Bright(const Rays &r) {
+Solver::Rays Solver::Bright(const Rays &r) const {
   size_t nb = 0;
   for (char b : r.B) nb += b != 0;
   if (r.B.empty() || nb == r.size() || Starved(r)) return r;
@@ -1347,8 +1361,13 @@ Solver::Rays Solver::Thin(const Rays &r) {
   return o;
 }
 
-static int SecondBest(const int *c, size_t K) {
+static int SecondBest(const int *c, size_t K, bool rest) {
   if (K < 2) return 0;
+  if (rest) {  // all but the best (Solver::dim_dots_)
+    int m = 0, t = 0;
+    for (size_t k = 0; k < K; k++) { t += c[k]; m = std::max(m, c[k]); }
+    return t - m;
+  }
   int a = -1, b = -1;  // best, second
   for (size_t k = 0; k < K; k++) {
     if (c[k] > a) { b = a; a = c[k]; }
@@ -1368,6 +1387,20 @@ bool Solver::Acquire(double now, X4 &best, int &bs, int &tight) {
   Rays t = Thin(r);
   std::vector<X4> H;
   Hypotheses(t, S, H);
+  const std::vector<BodyBin> bins = body_bins_ ? body_bins_() : std::vector<BodyBin>();
+  if (!bins.empty() && !BodyTells(bins)) {  // devices worn or held, the head hasn't moved enough for them to tell yet
+    if (body_wait_ > now) body_wait_ = now;
+    if (now - body_wait_ < kBodyWait) return false;
+  } else {
+    body_wait_ = 1e18;
+  }
+  const double turn = BodyTurn();
+  {  // the hypotheses the worn or held devices allow, if they allow any
+    std::vector<X4> ok;
+    for (const X4 &h : H)
+      if (BodyOk(h, bins, turn)) ok.push_back(h);
+    if (!ok.empty()) H.swap(ok);
+  }
   std::vector<X4> cand;
   if (has_acq_x_) cand.push_back(acq_x_);
   size_t K = S.size();
@@ -1386,7 +1419,7 @@ bool Solver::Acquire(double now, X4 &best, int &bs, int &tight) {
     for (size_t i = 0; i < ord.size(); i++) ord[i] = i;
     size_t n1 = std::min<size_t>(40, ord.size());
     std::partial_sort(ord.begin(), ord.begin() + n1, ord.end(),
-                      [&](size_t a, size_t b) { return SecondBest(&c1[a * K], K) > SecondBest(&c1[b * K], K); });
+                      [&](size_t a, size_t b) { return SecondBest(&c1[a * K], K, dim_dots_) > SecondBest(&c1[b * K], K, dim_dots_); });
     std::vector<X4> top;
     for (size_t i = 0; i < n1; i++) top.push_back(H[ord[i]]);
     std::vector<int> all(t.size()), c2;
@@ -1396,11 +1429,13 @@ bool Solver::Acquire(double now, X4 &best, int &bs, int &tight) {
     for (size_t i = 0; i < o2.size(); i++) o2[i] = i;
     size_t n2 = std::min<size_t>(5, o2.size());
     std::partial_sort(o2.begin(), o2.begin() + n2, o2.end(),
-                      [&](size_t a, size_t b) { return SecondBest(&c2[a * K], K) > SecondBest(&c2[b * K], K); });
+                      [&](size_t a, size_t b) { return SecondBest(&c2[a * K], K, dim_dots_) > SecondBest(&c2[b * K], K, dim_dots_); });
     for (size_t i = 0; i < n2; i++) cand.push_back(top[o2[i]]);
   }
   bs = -1;
-  bool have = false;
+  bool have = false, have_near = false;
+  X4 far_x{};
+  int far_s = -1;
   for (X4 x : cand) {
     for (double gate : {1.5, 0.6}) {
       FitR f = Fit(x, S, Z, r, now, gate, nullptr);
@@ -1410,15 +1445,61 @@ bool Solver::Acquire(double now, X4 &best, int &bs, int &tight) {
     std::vector<int> c;
     Support(x, S, Z, t, INLIER, c);
     int sc = Score(c);
-    if (sc > bs) { best = x; bs = sc; have = true; }
+    if (BodyOk(x, bins, turn)) {
+      if (!have_near || sc > bs) { best = x; bs = sc; have = have_near = true; }
+    } else {
+      if (sc > far_s) { far_x = x; far_s = sc; }
+      if (!have_near && sc > bs) { best = x; bs = sc; have = true; }
+    }
   }
   if (!have) return false;
+  if (have_near && far_s > bs && now - far_said_ > 60) {
+    far_said_ = now;
+    log_(Fmt("acquisition: yaw %+.1f deg (support %d) would put the lighthouse devices worn or held %.1f m from the head: "
+             "yaw %+.1f deg (support %d, %.1f m) instead", far_x[0] * kDeg, far_s, BodyFar(far_x, bins), best[0] * kDeg, bs,
+             BodyFar(best, bins)));
+  }
   CheckMirror(best, bs, S, Z, r, t, now);
   acq_x_ = best; has_acq_x_ = true;
   std::vector<int> c;
   Support(best, S, Z, t, TIGHT_DEG, c);
   tight = Score(c);
   return true;
+}
+
+double Solver::BodyTurn() const {
+  double coh = 0, turn = body_turn_ ? body_turn_(coh) : NAN;
+  return std::isfinite(turn) && coh >= kBodyCoh ? turn : NAN;
+}
+
+bool Solver::BodyOk(const X4 &x, const std::vector<BodyBin> &bins, double turn) const {
+  if (std::isfinite(turn) && std::fabs(Wrap(x[0] - turn)) * kDeg > kBodyTurn) return false;
+  return BodyAllows(x, bins);
+}
+
+bool Solver::BodyTells(const std::vector<BodyBin> &b) {
+  if (b.size() < (size_t)kBodyMinBins) return false;
+  double path = 0;
+  for (size_t i = 1; i < b.size(); i++) path += std::hypot(b[i].head.x - b[i - 1].head.x, b[i].head.z - b[i - 1].head.z);
+  return path >= kBodyPath;
+}
+
+double Solver::BodyFar(const X4 &x, const std::vector<BodyBin> &b) {
+  if (!BodyTells(b)) return NAN;
+  double c = std::cos(x[0]), s = std::sin(x[0]);
+  std::vector<double> d;
+  d.reserve(b.size());
+  for (const BodyBin &e : b) {
+    double m = kInf;
+    for (const V3 &p : e.dev) {
+      V3 q = RyMul(c, s, p) + V3{x[1], x[2], x[3]};
+      m = std::min(m, std::hypot(q.x - e.head.x, q.z - e.head.z));
+    }
+    d.push_back(m);
+  }
+  size_t k = std::min(d.size() - 1, (size_t)(kBodyShare * d.size()));
+  std::nth_element(d.begin(), d.begin() + k, d.end());
+  return d[k];
 }
 
 int Solver::ThinnedScore(const X4 &x, double now) {
@@ -1507,7 +1588,7 @@ void Solver::CheckMirror(X4 &best, int &bs, const std::vector<V3> &S, const std:
     pick_m = fav == 2;
     state = pick_m ? 1 : 2;
     why = how + (pick_m ? ": the mirror" : ": the fit");
-  } else if (has_x_) {
+  } else if (has_x_ && !x_dead_) {
     pick_m = Apart(m, x_, S) < Apart(best, x_, S);
     state = 3;
     why = "no lighthouse device near the head tells them apart: the current fit stays";
@@ -1790,6 +1871,19 @@ StepStat Solver::Step(double /*now*/) {
     if (Acquire(now, xa, sa, tight)) {
       int cur = has_x_ ? ThinnedScore(x_, now) : 0;
       st.has_acq = true; st.acq_sa = sa; st.acq_cur = cur; st.acq_tight = tight;
+      // a current fit the sightings don't back (a stale seed, or a wrong fit) is no fit: the guards below protect a
+      // working one from a lucky candidate, and would keep a dead one for good (a dead one has 0 support, a candidate in
+      // a two-station room seldom twice ACQ, and the worn devices only tell a fit from its mirror)
+      if (has_x_ && cur * 4 < ACQ && sa >= ACQ / 2) {
+        if (dead_since_ > now) dead_since_ = now;
+        if (!x_dead_ && now - dead_since_ >= kDeadFor) {
+          x_dead_ = true;
+          log_(Fmt("the current fit (yaw %+.1f deg) has explained next to no sightings for %.0f s (support %d, a candidate "
+                   "%d): acquiring as if from scratch", x_[0] * kDeg, now - dead_since_, cur, sa));
+        }
+      } else if (cur * 4 >= ACQ) {
+        dead_since_ = 1e18; x_dead_ = false;
+      }
       // the mirror check's flip has the worn devices for evidence as well: half the support will do. A fit far off the
       // current one (four stations in a square fit about as well turned by 90 deg) goes by the worn or held devices
       // too; without them it takes twice the support, or tight sightings: a wrong fit that lines stations up with other
@@ -1797,10 +1891,28 @@ StepStat Solver::Step(double /*now*/) {
       int k = acq_dim_ ? 2 : 1;  // dim rays: other lights line up with a wrong alignment more easily
       double dn, dc;
       std::string how;
-      bool far = has_x_ && !acq_forced_ && Apart(xa, x_, S) > 1.0;
+      bool far = has_x_ && !x_dead_ && !acq_forced_ && Apart(xa, x_, S) > 1.0;
       int fav = far ? BodyFavours(xa, x_, dn, dc, how) : 0;
+      if (far && fav != 1 && body_bins_) {  // a candidate the devices allow, a current fit they don't
+        const std::vector<BodyBin> bins = body_bins_();
+        double turn = BodyTurn(), fa = BodyFar(xa, bins), fc = BodyFar(x_, bins);
+        if (BodyOk(xa, bins, turn) && !BodyOk(x_, bins, turn) && (std::isfinite(turn) || std::isfinite(fa))) {
+          fav = 1;
+          how = std::isfinite(turn)
+                    ? Fmt("the lighthouse devices worn or held step as the head does turned by %+.1f deg", turn * kDeg)
+                    : Fmt("the lighthouse devices worn or held stay within %.1f m of the head one way, %.1f m the other",
+                          fa, fc);
+        }
+      }
       int need = far && !fav ? 2 * ACQ : ACQ;
-      bool enough = sa >= k * need || tight >= k * TIGHT_N || (acq_forced_ && sa >= k * ACQ / 2);
+      // the devices' steps tell the turn, and it agrees (Acquire only offers such candidates then): evidence besides the
+      // rays, as the mirror check's is, and half the support will do
+      bool body = false;
+      if (body_bins_ && body_turn_) {
+        double turn = BodyTurn();
+        body = std::isfinite(turn) && BodyOk(xa, body_bins_(), turn);
+      }
+      bool enough = sa >= k * need || tight >= k * TIGHT_N || ((acq_forced_ || body) && sa >= k * ACQ / 2);
       if (!enough || !(sa > 2 * cur + 5 || acq_forced_)) {
       } else if (fav == 2) {
         if (now - kept_said_ > 60) {
@@ -2221,6 +2333,8 @@ Sync::Sync(SyncConfig cfg, LogFn log)
   if (cfg_.arrival_clock) expo_ = kExpoArrival;
   solver_.SetBody([this](const X4 &x) { return BodyDist(x); });
   solver_.SetMotion([this](const X4 &x, double &moved) { return BodyMotion(x, moved); });
+  solver_.SetBodyBins([this]() { return BodyBins(); });
+  solver_.SetBodyTurn([this](double &coh) { return BodyTurn(coh); });
   solver_.SetInImage([this](int cam, V3 d) {
     std::lock_guard<std::mutex> g(net_);
     return have_optics_ && optics_.InImage(cam, d, 8.0);
@@ -2314,6 +2428,7 @@ bool Sync::SetCalibration(const std::string &json, std::string *err) {
   have_optics_ = true;
   // a Quest's frame period is one of two, the Frame's is learned from its frames
   grid_quest_ = !optics_.exact_time() && !cfg_.learn_grid;
+  solver_.SetDimDots(optics_.exact_time());  // the Steam Frame (Optics::LoadFrame)
   grid_ = FrameGrid(grid_quest_);
   grid_logged_.clear();
   return true;
@@ -2390,6 +2505,66 @@ double Sync::BodyDist(const X4 &x) {
 // How the worn or held lighthouse devices' horizontal motion follows the head's, were x the alignment: the
 // correlation of their steps (about 0.3 s each) with the head's over the same times, all devices together. +1 every
 // step along, -1 every step against; devices left lying add nothing. moved: the head's own path meanwhile (m).
+std::vector<BodyBin> Sync::BodyBins() {
+  std::vector<BodyS> b;
+  {
+    std::lock_guard<std::mutex> g(body_m_);
+    b.assign(body_.begin(), body_.end());
+  }
+  M3 C;
+  V3 tc;
+  frame_.Rotation(C, tc);
+  std::map<long long, BodyBin> per;  // 0.1 s moments
+  for (const BodyS &e : b) {
+    M3 R;
+    V3 h;
+    if (!poses_.At(e.t, R, h)) continue;
+    auto it = per.find((long long)std::floor(e.t * 10));
+    if (it == per.end()) it = per.emplace((long long)std::floor(e.t * 10), BodyBin{h, {}}).first;
+    it->second.dev.push_back(C * e.p + tc);
+  }
+  std::vector<BodyBin> out;
+  out.reserve(per.size());
+  for (auto &kv : per) out.push_back(std::move(kv.second));
+  return out;
+}
+
+double Sync::BodyTurn(double &coh) {
+  std::vector<BodyS> b;
+  {
+    std::lock_guard<std::mutex> g(body_m_);
+    b.assign(body_.begin(), body_.end());
+  }
+  coh = 0;
+  M3 C;
+  V3 tc;
+  frame_.Rotation(C, tc);
+  std::map<int, std::vector<const BodyS *>> per;
+  for (const BodyS &e : b) per[e.dev].push_back(&e);
+  double sn = 0, cs = 0, mag = 0, path = 0;
+  int n = 0;
+  for (auto &kv : per) {  // each device's 0.25 s steps against the head's
+    const std::vector<const BodyS *> &v = kv.second;
+    for (size_t i = 0, j = 0; i < v.size(); i = j) {
+      for (j = i + 1; j < v.size() && v[j]->t - v[i]->t < 0.25; j++) {}
+      if (j >= v.size()) break;
+      if (v[j]->t - v[i]->t > 0.5) continue;
+      M3 R;
+      V3 h0, h1;
+      if (!poses_.At(v[i]->t, R, h0) || !poses_.At(v[j]->t, R, h1)) continue;
+      V3 a = C * (v[j]->p - v[i]->p), h = h1 - h0;  // RyMul(yaw) a ~ h
+      sn += a.z * h.x - a.x * h.z;
+      cs += a.z * h.z + a.x * h.x;
+      mag += std::hypot(a.x, a.z) * std::hypot(h.x, h.z);
+      path += std::hypot(h.x, h.z);
+      n++;
+    }
+  }
+  if (n < 40 || !(mag > 0) || path / per.size() < kBodyPath) return NAN;
+  coh = std::hypot(sn, cs) / mag;
+  return std::atan2(sn, cs);
+}
+
 double Sync::BodyMotion(const X4 &x, double &moved) {
   std::vector<BodyS> b;
   {
@@ -2531,26 +2706,95 @@ void Sync::Use(const Shot &f) {
     prev = big;
   }
   if (still) { spots_.still += nb; return; }
+  fixed_frames_[cam]++;
   M3 Rc;
   V3 tc;
   if (have_lag && w <= kWmax && optics_.Pose(cam, Rc, tc)) solver_.AddFrame(t, hg, cam, p + R * tc, R * Rc);
+  // each camera's spots wait kSteadyRun - 1 frames before they go on: a steady light found in a frame takes its run's
+  // first frames with it
+  auto &pend = steady_[cam];
+  if (!pend.empty() && !(t - pend.back().t > 0 && t - pend.back().t <= kSteadyGap)) FlushSteady(cam, 0);
+  const double cos_steady = std::cos(kSteadyDeg / kDeg);
+  PendFrame fr{t, {}};
   for (const Spot &b : bl) {
     int x10 = b.x10, y10 = b.y10, npx = b.npx;
     if (npx > kMaxPx) { spots_.big++; continue; }
     V3 o, d;
     if (!optics_.Ray(cam, x10 / 10.0 - 0.5, y10 / 10.0 - 0.5, o, d)) { spots_.other++; continue; }
-    if (have_lag && cfg_.learn_timing) timing_.Record(grid_pc, o, d, hg, cam, b.peak >= kBright);
-    if (g_ray_dump) {
-      V3 O = p + R * o, D = R * d;
-      fprintf(g_ray_dump, "R %.6f %d %.6f %.6f %.6f %.7f %.7f %.7f %.6f %.6f %.6f %.1f %d\n", t, cam, O.x, O.y, O.z, D.x,
-              D.y, D.z, p.x, p.y, p.z, w, b.peak);
+    if (FixedSpot(cam, x10, y10, R * d)) { spots_.fixed++; continue; }
+    PendSpot q{o, d, R * d, p, R, hg, grid_pc, w, b.peak, have_lag, 1, -1, false};
+    if (!pend.empty()) {  // lit in this direction in the camera's last short frame too
+      const std::vector<PendSpot> &pv = pend.back().s;
+      for (size_t i = 0; i < pv.size(); i++)
+        if (dot(pv[i].D, q.D) > cos_steady && pv[i].run + 1 > q.run) { q.run = pv[i].run + 1; q.from = (int)i; }
     }
-    if (w > kWmax) { spots_.fast++; continue; }
-    bool bright = b.peak >= kBright;
-    solver_.Add(t, p + R * o, R * d, hg, cam, bright);  // dim ones too: they tell when the room is too light
-    if (bright || solver_.starved()) spots_.used++;
-    else spots_.dim++;
+    fr.s.push_back(q);
   }
+  pend.push_back(std::move(fr));
+  for (size_t j = 0; j < pend.back().s.size(); j++) {  // a steady light: its run, back through the frames waiting
+    if (pend.back().s[j].run < kSteadyRun) continue;
+    size_t k = pend.size() - 1;
+    int i = (int)j;
+    while (i >= 0 && !pend[k].s[i].drop) {
+      pend[k].s[i].drop = true;
+      i = pend[k].s[i].from;
+      if (k == 0) break;
+      k--;
+    }
+  }
+  FlushSteady(cam, kSteadyRun - 1);
+}
+
+void Sync::FlushSteady(int cam, size_t keep) {
+  auto &pend = steady_[cam];
+  while (pend.size() > keep) {
+    const PendFrame &fr = pend.front();
+    for (const PendSpot &q : fr.s) {
+      if (q.drop) { spots_.steady++; continue; }
+      if (q.have_lag && cfg_.learn_timing) timing_.Record(q.grid_pc, q.o, q.d, q.hg, cam, q.peak >= kBright);
+      V3 O = q.p + q.R * q.o;
+      if (g_ray_dump)
+        fprintf(g_ray_dump, "R %.6f %d %.6f %.6f %.6f %.7f %.7f %.7f %.6f %.6f %.6f %.1f %d\n", fr.t, cam, O.x, O.y, O.z,
+                q.D.x, q.D.y, q.D.z, q.p.x, q.p.y, q.p.z, q.w, q.peak);
+      if (q.w > kWmax) { spots_.fast++; continue; }
+      bool bright = q.peak >= kBright;
+      solver_.Add(fr.t, O, q.D, q.hg, cam, bright);  // dim ones too: they tell when the room is too light
+      if (bright || solver_.starved()) spots_.used++;
+      else spots_.dim++;
+    }
+    pend.pop_front();
+  }
+}
+
+bool Sync::FixedSpot(int cam, int x10, int y10, V3 d) {
+  const long n = fixed_frames_[cam];
+  const float a = 1.0f / kFixedFrames;
+  auto &cells = fixed_[cam];
+  auto decay = [&](FixedCell &c) {  // to this frame
+    if (c.at < n) {
+      float k = std::pow(1 - a, (float)(n - c.at));
+      c.rate *= k;
+      c.dir = c.dir * k;
+      c.at = n;
+    }
+  };
+  const int bx = x10 / (10 * kFixedPx), by = y10 / (10 * kFixedPx);
+  auto key = [](int x, int y) { return (x + 1) * 4096 + (y + 1); };  // cells from -1 (a neighbour off the edge)
+  float rate = 0;
+  V3 dir;
+  for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+      auto it = cells.find(key(bx + dx, by + dy));
+      if (it == cells.end()) continue;
+      decay(it->second);
+      rate += it->second.rate;
+      dir += it->second.dir;
+    }
+  FixedCell &c = cells[key(bx, by)];
+  decay(c);
+  c.rate += a;
+  c.dir += d * a;
+  return rate >= kFixedRate && norm(dir) < kFixedSpread * rate;
 }
 
 std::string Sync::Describe(const Spots &a, const Spots &b) {
@@ -2561,6 +2805,8 @@ std::string Sync::Describe(const Spots &a, const Spots &b) {
   part(b.still - a.still, "while the headset was still");
   part(b.fast - a.fast, "while it turned fast");
   part(b.big - a.big, "lamps or windows");
+  part(b.fixed - a.fixed, "fixed to the headset");
+  part(b.steady - a.steady, "steady lights");
   part(b.other - a.other, "without a headset pose");
   part(b.dim - a.dim, "dim, kept for a room too light for the dots to saturate");
   return Fmt("%ld bright spots, %ld used", n, b.used - a.used) + (why.empty() ? "" : " (" + why + ")");
@@ -2803,12 +3049,25 @@ static bool Locked(bool has_x, const StepStat &st) {
 }
 
 Transform Sync::Tick(double now) {
+  if (reset_req_.exchange(false)) {
+    solver_.Forget();
+    have_applied_ = false;
+    quest_.clear();
+    seeded_ = true;
+    has_saved_ = false;
+    std::remove(Join(cfg_.dir, "state.json").c_str());
+    log_("alignment reset from the dashboard: acquiring afresh (state.json removed, stations.json kept)");
+  }
   if (now - last_step_ >= 1.0) {
     last_step_ = now;
     int b = poses_.brk_id();
     if (b != brk_seen_) {
       brk_seen_ = b;
       solver_.PoseBreak(poses_.brk_t());
+      {  // the devices' places before it go with the head's older space
+        std::lock_guard<std::mutex> g(body_m_);
+        while (!body_.empty() && body_.front().t < poses_.brk_t()) body_.pop_front();
+      }
       log_("HMD pose break (" + poses_.brk_what() + "): older sightings dropped, acquiring");
     }
     std::map<std::string, std::pair<V3, M3>> raw;

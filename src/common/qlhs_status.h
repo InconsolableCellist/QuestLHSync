@@ -30,6 +30,7 @@ enum QlhsCmd : int32_t {
   QLHS_CMD_RESUME = 3,
   QLHS_CMD_RECORD_ON = 4,
   QLHS_CMD_RECORD_OFF = 5,
+  QLHS_CMD_RESET = 6,  // forget the alignment (state.json) and acquire afresh; stations.json stays
 };
 
 #pragma pack(push, 8)
