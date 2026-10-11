@@ -390,9 +390,7 @@ class Solver {
   bool Starved(const Rays &r) const;
   // the Steam Frame: its cameras seldom see a base station's dot saturate (a recording: 95% of the sightings of the
   // stations dim, while the bright spots were mostly other lights), so the dim ones always count, as in a room too light
-  // (Starved), and a fit scores every station's support but the best seen one's, not only the second best's: a fit of
-  // two stations scores the same, one a third station's sightings agree with more (the same recording: the dim
-  // sightings of a third station told the true fit from one 5 deg and 0.7 m off it, which two stations fit as well)
+  // (Starved)
   std::atomic<bool> dim_dots_{false};
   double DimGate() const { return starved_ ? INLIER : -1; }
   int amb_state_ = 0;        // the mirror check's last outcome, logged when it changes
@@ -409,7 +407,7 @@ class Solver {
 
   Rays GetRays(double t0);
   void Support(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double gate, std::vector<int> &cnt) const;
-  int Score(const std::vector<int> &c) const;
+  static int Score(const std::vector<int> &c);
   static void Cells(const Rays &r, const std::vector<char> &use, std::vector<int> &cnt);
   // pivot: also fit a tilt of the stations about it (6 DOF), returned in FitR::tilt; with axis (horizontal, unit),
   // only about that axis (5 DOF, FitR::theta too). dim_gate: the gate for rays dimmer than kBright, when narrower

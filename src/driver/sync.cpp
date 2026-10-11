@@ -1020,12 +1020,14 @@ void Solver::Support(const X4 &x, const std::vector<V3> &S, const std::vector<V3
   }
 }
 
-int Solver::Score(const std::vector<int> &c) const {  // yaw needs two stations: the second-best count
+// yaw needs two stations: every station's support but the best seen one's. Only the second best's, a fit of two
+// stations scored the same as one a third station's sightings agree with too (a Steam Frame recording: the dim
+// sightings of a third station told the true fit from one 5 deg and 0.7 m off it, which two stations fit as well)
+int Solver::Score(const std::vector<int> &c) {
   if (c.size() < 2) return 0;
   std::vector<int> v = c;
   std::sort(v.begin(), v.end());
-  if (dim_dots_) return std::accumulate(v.begin(), v.end() - 1, 0);  // all but the best (dim_dots_)
-  return v[v.size() - 2];
+  return std::accumulate(v.begin(), v.end() - 1, 0);
 }
 
 struct CellKey {
@@ -1359,19 +1361,11 @@ Solver::Rays Solver::Thin(const Rays &r) {
   return o;
 }
 
-static int SecondBest(const int *c, size_t K, bool rest) {
+static int SecondBest(const int *c, size_t K) {  // Solver::Score's: all but the best
   if (K < 2) return 0;
-  if (rest) {  // all but the best (Solver::dim_dots_)
-    int m = 0, t = 0;
-    for (size_t k = 0; k < K; k++) { t += c[k]; m = std::max(m, c[k]); }
-    return t - m;
-  }
-  int a = -1, b = -1;  // best, second
-  for (size_t k = 0; k < K; k++) {
-    if (c[k] > a) { b = a; a = c[k]; }
-    else if (c[k] > b) b = c[k];
-  }
-  return b;
+  int m = 0, t = 0;
+  for (size_t k = 0; k < K; k++) { t += c[k]; m = std::max(m, c[k]); }
+  return t - m;
 }
 
 // best hypothesis from scratch on the last ACQ_WIN s: score = thinned support, tight = the same within TIGHT_DEG
@@ -1417,7 +1411,7 @@ bool Solver::Acquire(double now, X4 &best, int &bs, int &tight) {
     for (size_t i = 0; i < ord.size(); i++) ord[i] = i;
     size_t n1 = std::min<size_t>(40, ord.size());
     std::partial_sort(ord.begin(), ord.begin() + n1, ord.end(),
-                      [&](size_t a, size_t b) { return SecondBest(&c1[a * K], K, dim_dots_) > SecondBest(&c1[b * K], K, dim_dots_); });
+                      [&](size_t a, size_t b) { return SecondBest(&c1[a * K], K) > SecondBest(&c1[b * K], K); });
     std::vector<X4> top;
     for (size_t i = 0; i < n1; i++) top.push_back(H[ord[i]]);
     std::vector<int> all(t.size()), c2;
@@ -1427,7 +1421,7 @@ bool Solver::Acquire(double now, X4 &best, int &bs, int &tight) {
     for (size_t i = 0; i < o2.size(); i++) o2[i] = i;
     size_t n2 = std::min<size_t>(5, o2.size());
     std::partial_sort(o2.begin(), o2.begin() + n2, o2.end(),
-                      [&](size_t a, size_t b) { return SecondBest(&c2[a * K], K, dim_dots_) > SecondBest(&c2[b * K], K, dim_dots_); });
+                      [&](size_t a, size_t b) { return SecondBest(&c2[a * K], K) > SecondBest(&c2[b * K], K); });
     for (size_t i = 0; i < n2; i++) cand.push_back(top[o2[i]]);
   }
   bs = -1;
