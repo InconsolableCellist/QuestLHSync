@@ -545,7 +545,7 @@ class Sync {
   };
   Status GetStatus(double now);
   // the cameras' bright spots so far, and what became of them
-  struct Spots { long frames = 0, seen = 0, used = 0, still = 0, fast = 0, big = 0, other = 0, dim = 0, steady = 0; };
+  struct Spots { long frames = 0, seen = 0, used = 0, still = 0, fast = 0, big = 0, other = 0, dim = 0; };
   Spots spots() { std::lock_guard<std::mutex> g(net_); return spots_; }
   static std::string Describe(const Spots &from, const Spots &to);
   void StationsForDump(std::vector<std::string> &keys, std::vector<V3> &S) const {  // tools
@@ -595,24 +595,6 @@ class Sync {
   Spots spots_;  // under net_
   std::map<int, std::vector<std::pair<double, double>>> prev_big_;  // under net_: each camera's last steady lights
   long img_moved_ = 0, img_still_ = 0;  // under net_: of those, while SteamVR's headset stands still
-  // under net_: steady lights. A base station's laser shows in a short frame only when its sweep and the exposure meet,
-  // a frame or two in a row at most (the recording: 22-43% of its sightings in the very next frame); a lamp or LED that
-  // is on shows in every frame it's in view (96-99%), and one about 1 m from a base station drew the fit there, 0.7-1 m
-  // up. A room direction lit in kSteadyRun short frames of a camera in a row, within kSteadyDeg, is such a light
-  struct PendSpot {
-    V3 o, d, D, p;  // the ray in the head frame; D: its direction in the Quest frame; p, R: the head
-    M3 R;
-    double hg, grid_pc, w;
-    int peak;
-    bool have_lag;
-    int run, from;  // short frames in a row lit this way; the spot it follows in the frame before, -1 none
-    bool drop;
-  };
-  struct PendFrame { double t; std::vector<PendSpot> s; };
-  std::map<int, std::deque<PendFrame>> steady_;
-  void FlushSteady(int cam, size_t keep);  // a camera's waiting frames on to the solver, but the last keep
-  static constexpr int kSteadyRun = 4;
-  static constexpr double kSteadyDeg = 1.0, kSteadyGap = 0.05;  // deg; s between a camera's short frames, at most
   // under net_: short frames waiting for their head pose (kPoseWait), in arrival order
   struct Spot { int x10, y10, npx, peak; };
   struct Shot { double pc, t, hg, grid_pc; int cam; bool have_lag; std::vector<Spot> bl; };

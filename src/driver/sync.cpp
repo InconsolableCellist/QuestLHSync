@@ -3256,60 +3256,25 @@ void Sync::Use(const Shot &f) {
   M3 Rc;
   V3 tc;
   if (have_lag && w <= kWmax && optics_.Pose(cam, Rc, tc)) solver_.AddFrame(t, hg, cam, p + R * tc, R * Rc);
-  // each camera's spots wait kSteadyRun - 1 frames before they go on: a steady light found in a frame takes its run's
-  // first frames with it
-  auto &pend = steady_[cam];
-  if (!pend.empty() && !(t - pend.back().t > 0 && t - pend.back().t <= kSteadyGap)) FlushSteady(cam, 0);
-  const double cos_steady = std::cos(kSteadyDeg / kDeg);
-  PendFrame fr{t, {}};
   for (const Spot &b : bl) {
     int x10 = b.x10, y10 = b.y10, npx = b.npx;
     if (npx > kMaxPx) { spots_.big++; continue; }
     V3 o, d;
     if (!optics_.Ray(cam, x10 / 10.0 - 0.5, y10 / 10.0 - 0.5, o, d)) { spots_.other++; continue; }
-    PendSpot q{o, d, R * d, p, R, hg, grid_pc, w, b.peak, have_lag, 1, -1, false};
-    if (!pend.empty()) {  // lit in this direction in the camera's last short frame too
-      const std::vector<PendSpot> &pv = pend.back().s;
-      for (size_t i = 0; i < pv.size(); i++)
-        if (dot(pv[i].D, q.D) > cos_steady && pv[i].run + 1 > q.run) { q.run = pv[i].run + 1; q.from = (int)i; }
+    if (have_lag && cfg_.learn_timing) timing_.Record(grid_pc, o, d, hg, cam, b.peak >= kBright);
+    if (g_ray_dump) {
+      V3 O = p + R * o, D = R * d;
+      fprintf(g_ray_dump, "R %.6f %d %.6f %.6f %.6f %.7f %.7f %.7f %.6f %.6f %.6f %.1f %d\n", t, cam, O.x, O.y, O.z, D.x,
+              D.y, D.z, p.x, p.y, p.z, w, b.peak);
     }
-    fr.s.push_back(q);
+    if (w > kWmax) { spots_.fast++; continue; }
+    bool bright = b.peak >= kBright;
+    solver_.Add(t, p + R * o, R * d, hg, cam, bright);  // dim ones too: they tell when the room is too light
+    if (bright || solver_.starved()) spots_.used++;
+    else spots_.dim++;
   }
-  pend.push_back(std::move(fr));
-  for (size_t j = 0; j < pend.back().s.size(); j++) {  // a steady light: its run, back through the frames waiting
-    if (pend.back().s[j].run < kSteadyRun) continue;
-    size_t k = pend.size() - 1;
-    int i = (int)j;
-    while (i >= 0 && !pend[k].s[i].drop) {
-      pend[k].s[i].drop = true;
-      i = pend[k].s[i].from;
-      if (k == 0) break;
-      k--;
-    }
-  }
-  FlushSteady(cam, kSteadyRun - 1);
 }
 
-void Sync::FlushSteady(int cam, size_t keep) {
-  auto &pend = steady_[cam];
-  while (pend.size() > keep) {
-    const PendFrame &fr = pend.front();
-    for (const PendSpot &q : fr.s) {
-      if (q.drop) { spots_.steady++; continue; }
-      if (q.have_lag && cfg_.learn_timing) timing_.Record(q.grid_pc, q.o, q.d, q.hg, cam, q.peak >= kBright);
-      V3 O = q.p + q.R * q.o;
-      if (g_ray_dump)
-        fprintf(g_ray_dump, "R %.6f %d %.6f %.6f %.6f %.7f %.7f %.7f %.6f %.6f %.6f %.1f %d\n", fr.t, cam, O.x, O.y, O.z,
-                q.D.x, q.D.y, q.D.z, q.p.x, q.p.y, q.p.z, q.w, q.peak);
-      if (q.w > kWmax) { spots_.fast++; continue; }
-      bool bright = q.peak >= kBright;
-      solver_.Add(fr.t, O, q.D, q.hg, cam, bright);  // dim ones too: they tell when the room is too light
-      if (bright || solver_.starved()) spots_.used++;
-      else spots_.dim++;
-    }
-    pend.pop_front();
-  }
-}
 
 std::string Sync::Describe(const Spots &a, const Spots &b) {
   long n = b.seen - a.seen;
@@ -3319,7 +3284,6 @@ std::string Sync::Describe(const Spots &a, const Spots &b) {
   part(b.still - a.still, "while the headset was still");
   part(b.fast - a.fast, "while it turned fast");
   part(b.big - a.big, "lamps or windows");
-  part(b.steady - a.steady, "steady lights");
   part(b.other - a.other, "without a headset pose");
   part(b.dim - a.dim, "dim, kept for a room too light for the dots to saturate");
   return Fmt("%ld bright spots, %ld used", n, b.used - a.used) + (why.empty() ? "" : " (" + why + ")");
